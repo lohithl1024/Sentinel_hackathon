@@ -4,19 +4,25 @@ Register `ai_router` on the main app to expose the AI proxy + audit endpoints.
 
 Endpoints:
   POST /api/ai/chat                        Main proxy (used by mobile chat + external clients)
+  POST /api/ai/scan                        Scan-only mode (no LLM call, just risk assessment)
+  POST /api/ai/scan-file                   Scan uploaded file for prompt injection
   GET  /api/ai/events                      AI scoring events (officer)
   GET  /api/ai/events/me                   Current user's AI events
   GET  /api/ai/events/{event_id}           Single event (officer)
   POST /api/ai/simulate                    Trigger an AI attack scenario (auth required)
   GET  /api/ai/analytics                   Aggregate AI-side metrics for dashboards
+  GET  /api/ai/session-risk/{conv_id}      Get session-level behavioral risk
 """
 
 import uuid
 import logging
+import base64
+import io
+import re
 from datetime import datetime, timezone
 from typing import Optional, List, Literal
 
-from fastapi import APIRouter, HTTPException, Depends, Body
+from fastapi import APIRouter, HTTPException, Depends, Body, UploadFile, File, Form
 from pydantic import BaseModel, Field
 
 from ai_proxy import (
@@ -27,6 +33,177 @@ from ai_proxy import (
 
 log = logging.getLogger("ai_routes")
 ai_router = APIRouter(prefix="/api/ai")
+
+
+# =============================================================================
+# Attack Classification
+# =============================================================================
+
+ATTACK_TYPES = {
+    "injection": "PROMPT_INJECTION",
+    "jailbreak": "JAILBREAK_ATTEMPT",
+    "extraction": "DATA_EXTRACTION",
+    "pii": "PII_EXTRACTION",
+    "dan": "JAILBREAK_DAN",
+    "manipulation": "ROLE_MANIPULATION",
+    "encoded": "ENCODED_PAYLOAD",
+    "token_abuse": "TOKEN_ABUSE",
+    "repeat": "REPETITION_ATTACK",
+}
+
+def classify_attack(reasons: List[str], feats: dict) -> List[str]:
+    """Classify attack types based on detected patterns"""
+    attacks = []
+    reasons_lower = " ".join(reasons).lower()
+    
+    if "injection" in reasons_lower or "ignore" in reasons_lower:
+        attacks.append("PROMPT_INJECTION")
+    if "jailbreak" in reasons_lower or "dan" in reasons_lower:
+        attacks.append("JAILBREAK_ATTEMPT")
+    if "extract" in reasons_lower or "reveal" in reasons_lower or "system prompt" in reasons_lower:
+        attacks.append("DATA_EXTRACTION")
+    if "pii" in reasons_lower or "ssn" in reasons_lower or "credit card" in reasons_lower:
+        attacks.append("PII_EXTRACTION")
+    if "encoded" in reasons_lower or "base64" in reasons_lower:
+        attacks.append("ENCODED_PAYLOAD")
+    if feats.get("rule_hits", 0) >= 2 and "role" in reasons_lower:
+        attacks.append("ROLE_MANIPULATION")
+    if feats.get("repeat_count", 0) >= 3:
+        attacks.append("REPETITION_ATTACK")
+    
+    return attacks if attacks else ["NORMAL"]
+
+
+# =============================================================================
+# Multi-Turn Behavioral Analysis
+# =============================================================================
+
+async def analyze_session_behavior(db, user_id: str, conversation_id: str) -> dict:
+    """Analyze behavior patterns across the conversation session"""
+    # Get all events in this conversation
+    events = await db.ai_events.find(
+        {"user_id": user_id, "conversation_id": conversation_id},
+        {"_id": 0}
+    ).sort("timestamp", 1).to_list(50)
+    
+    if len(events) < 2:
+        return {
+            "session_risk": 0,
+            "escalation_detected": False,
+            "turn_count": len(events),
+            "pattern": "NORMAL"
+        }
+    
+    # Analyze escalation pattern
+    risk_scores = [e.get("risk_score", 0) for e in events]
+    rule_hits = [e.get("prompt_features", {}).get("rule_hits", 0) for e in events]
+    
+    # Detect escalation: risk increasing over time
+    escalation_count = sum(1 for i in range(1, len(risk_scores)) if risk_scores[i] > risk_scores[i-1])
+    escalation_ratio = escalation_count / (len(risk_scores) - 1) if len(risk_scores) > 1 else 0
+    
+    # Detect probing: multiple medium-risk attempts
+    probing_count = sum(1 for r in risk_scores if 30 <= r <= 60)
+    
+    # Calculate session-level risk
+    avg_risk = sum(risk_scores) / len(risk_scores)
+    max_risk = max(risk_scores)
+    total_rule_hits = sum(rule_hits)
+    
+    # Session risk formula
+    session_risk = int(min(100, (
+        avg_risk * 0.3 +
+        max_risk * 0.3 +
+        escalation_ratio * 30 +
+        min(20, probing_count * 5) +
+        min(20, total_rule_hits * 3)
+    )))
+    
+    # Determine pattern
+    pattern = "NORMAL"
+    if escalation_ratio > 0.5 and max_risk > 60:
+        pattern = "ESCALATION_ATTACK"
+    elif probing_count >= 3:
+        pattern = "PROBING_BEHAVIOR"
+    elif total_rule_hits >= 5:
+        pattern = "PERSISTENT_ATTACK"
+    elif avg_risk > 50:
+        pattern = "SUSPICIOUS_SESSION"
+    
+    return {
+        "session_risk": session_risk,
+        "escalation_detected": escalation_ratio > 0.5,
+        "turn_count": len(events),
+        "avg_risk": round(avg_risk, 1),
+        "max_risk": max_risk,
+        "escalation_ratio": round(escalation_ratio, 2),
+        "probing_count": probing_count,
+        "total_rule_hits": total_rule_hits,
+        "pattern": pattern
+    }
+
+
+# =============================================================================
+# File Scanning
+# =============================================================================
+
+def extract_text_from_file(content: bytes, filename: str) -> str:
+    """Extract text from uploaded file"""
+    ext = filename.lower().split(".")[-1] if "." in filename else ""
+    
+    if ext == "txt":
+        return content.decode("utf-8", errors="ignore")
+    
+    elif ext == "pdf":
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            text = ""
+            for page in reader.pages[:20]:  # Limit to 20 pages
+                text += page.extract_text() or ""
+            return text
+        except Exception as e:
+            log.warning(f"PDF extraction failed: {e}")
+            return ""
+    
+    elif ext in ("json", "xml", "html", "md", "csv"):
+        return content.decode("utf-8", errors="ignore")
+    
+    else:
+        # Try to decode as text
+        try:
+            return content.decode("utf-8", errors="ignore")
+        except:
+            return ""
+
+def scan_text_for_injection(text: str) -> dict:
+    """Scan extracted text for prompt injection patterns"""
+    # Use existing score_prompt function
+    risk, reasons, feats = score_prompt(text, repeat_count=0)
+    attacks = classify_attack(reasons, feats)
+    
+    # Additional file-specific checks
+    file_specific_patterns = [
+        (r"<!--.*?(ignore|system prompt|instructions).*?-->", "Hidden HTML comment injection"),
+        (r"%PDF.*?(ignore|instructions)", "PDF metadata injection"),
+        (r"\x00.*?(ignore|system)", "Null byte injection attempt"),
+    ]
+    
+    for pattern, reason in file_specific_patterns:
+        if re.search(pattern, text, re.IGNORECASE | re.DOTALL):
+            risk = min(100, risk + 20)
+            reasons.append(reason)
+            attacks.append("FILE_INJECTION")
+    
+    return {
+        "risk_score": risk,
+        "risk_level": risk_level_v2(risk),
+        "reasons": reasons,
+        "attack_types": list(set(attacks)),
+        "features": feats,
+        "text_length": len(text),
+        "action": decide_v2(risk)
+    }
 
 
 # =============================================================================
@@ -41,6 +218,11 @@ class ChatIn(BaseModel):
         "pii_extract", "token_bomb", "encoded_payload"
     ]] = None
 
+class ScanIn(BaseModel):
+    """Scan-only mode - analyze text without calling LLM"""
+    text: str = Field(min_length=1, max_length=16000)
+    input_type: Literal["text", "api_payload", "file_content"] = "text"
+    context: Optional[str] = None  # Optional context about the input source
 
 class AISimulateIn(BaseModel):
     email: str
@@ -160,6 +342,7 @@ async def _process_chat(db, user: dict, message: str, conversation_id: Optional[
             "risk_level": "CRITICAL",
             "risk_score": 100,
             "action": "BLOCKED",
+            "attack_types": ["ACCESS_REVOKED"],
             "response": "Your AI access has been suspended by the security team due to excessive usage or policy violations. Please contact your administrator.",
             "explanation": ["AI access revoked by security team"],
         }
@@ -174,14 +357,33 @@ async def _process_chat(db, user: dict, message: str, conversation_id: Optional[
 
     # 1. Score prompt
     p_risk, p_reasons, p_feats = score_prompt(message, repeat_count=rep)
+    
+    # 2. Classify attack type
+    attack_types = classify_attack(p_reasons, p_feats)
 
-    # 2. Velocity / token abuse
+    # 3. Velocity / token abuse
     v_feats = velocity_features(user["id"])
     v_risk_score, v_reasons = velocity_risk(v_feats)
+    if v_risk_score > 50:
+        attack_types.append("TOKEN_ABUSE")
 
-    # 3. Decide whether we even call the LLM
+    # 4. Get session behavioral analysis
+    session_behavior = await analyze_session_behavior(db, user["id"], conversation_id)
+    
+    # 5. Factor in session risk (multi-turn escalation detection)
+    session_risk_boost = 0
+    if session_behavior["escalation_detected"]:
+        session_risk_boost = 15
+        p_reasons.append(f"Escalation pattern detected across {session_behavior['turn_count']} turns")
+        attack_types.append("ESCALATION_ATTACK")
+    elif session_behavior["pattern"] == "PROBING_BEHAVIOR":
+        session_risk_boost = 10
+        p_reasons.append("Probing behavior detected in session")
+        attack_types.append("PROBING_ATTACK")
+
+    # 6. Decide whether we even call the LLM
     role_dev = _role_deviation(user.get("role"), p_feats["rule_hits"])
-    pre_total = aggregate_risk(p_risk, v_risk_score, response_risk=0, role_deviation=role_dev)
+    pre_total = aggregate_risk(p_risk + session_risk_boost, v_risk_score, response_risk=0, role_deviation=role_dev)
     pre_level = risk_level_v2(pre_total)
     timestamp = datetime.now(timezone.utc).isoformat()
     event_id = str(uuid.uuid4())
@@ -204,7 +406,7 @@ async def _process_chat(db, user: dict, message: str, conversation_id: Optional[
         record_usage(user["id"], tokens_used)
         r_risk, r_reasons, response_pii_count, response_redacted = score_response(text)
 
-    total = aggregate_risk(p_risk, v_risk_score, r_risk, role_dev)
+    total = aggregate_risk(p_risk + session_risk_boost, v_risk_score, r_risk, role_dev)
     level = risk_level_v2(total)
     action = decide_v2(total)
     reasons = p_reasons + v_reasons + r_reasons
@@ -212,6 +414,11 @@ async def _process_chat(db, user: dict, message: str, conversation_id: Optional[
         reasons.insert(0, "Prompt blocked before LLM call")
     if not reasons:
         reasons.append("Behavior consistent with baseline AI usage")
+    
+    # Dedupe attack types
+    attack_types = list(set(attack_types))
+    if "NORMAL" in attack_types and len(attack_types) > 1:
+        attack_types.remove("NORMAL")
 
     # PII-masked storage
     prompt_masked, prompt_pii_count, _ = mask_pii(message)
@@ -242,6 +449,8 @@ async def _process_chat(db, user: dict, message: str, conversation_id: Optional[
         "risk_score": total,
         "risk_level": level,
         "action": action,
+        "attack_types": attack_types,
+        "session_behavior": session_behavior,
         "explanation": reasons,
         "blocked_at_input": blocked_at_input,
         "simulated": simulated_event,
@@ -261,6 +470,9 @@ async def _process_chat(db, user: dict, message: str, conversation_id: Optional[
         "risk_score": total,
         "risk_level": level,
         "action": action,
+        "attack_types": attack_types,
+        "session_risk": session_behavior["session_risk"],
+        "session_pattern": session_behavior["pattern"],
         "explanation": reasons,
         "tokens_used": tokens_used,
         "simulated": simulated_event,
