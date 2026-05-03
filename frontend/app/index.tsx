@@ -1,3 +1,4 @@
+// this is team z
 import { useEffect } from "react";
 import { View, ActivityIndicator, StyleSheet } from "react-native";
 import { useRouter } from "expo-router";

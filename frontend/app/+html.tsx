@@ -1,3 +1,4 @@
+// this is team z
 // @ts-nocheck
 import { ScrollViewStyleReset } from "expo-router/html";
 import type { PropsWithChildren } from "react";

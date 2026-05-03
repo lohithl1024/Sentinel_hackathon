@@ -1,3 +1,4 @@
+// this is team z
 import { useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ActivityIndicator, ScrollView, TouchableOpacity,

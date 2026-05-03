@@ -1,3 +1,4 @@
+// this is team z
 import { useCallback, useEffect, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, RefreshControl, ActivityIndicator } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
