@@ -13,6 +13,7 @@ type ApprovalReq = {
   role: string; shift: string; risk_score: number; anomaly_score: number;
   reason: string[]; features: any; status: string; created_at: string;
   reviewed_by?: { email: string }; reviewed_at?: string; review_note?: string;
+  request_kind?: string; ai_prompt_redacted?: string; conversation_id?: string;
 };
 
 export default function Approvals() {
@@ -104,6 +105,7 @@ export default function Approvals() {
                 <StatusPill status={r.status} />
               </View>
               <View style={styles.metaRow}>
+                <Badge text={r.request_kind === "ai_prompt" ? "AI prompt" : "login"} />
                 <Badge text={r.role.replace("_", " ")} />
                 <Badge text={r.shift} />
                 <Text style={styles.ts}>{new Date(r.created_at).toLocaleString()}</Text>
@@ -155,11 +157,23 @@ export default function Approvals() {
                 ))}
 
                 <Text style={styles.sectionLabel}>CONTEXT</Text>
-                <Row k="Login hour" v={String(selected.features.login_hour)} />
-                <Row k="Device" v={selected.features.device_type} />
-                <Row k="Location" v={selected.features.geo_location} />
-                <Row k="IP" v={selected.features.ip_address} />
-                <Row k="Failed attempts" v={String(selected.features.failed_attempts)} />
+                {selected.request_kind === "ai_prompt" ? (
+                  <>
+                    <Row k="Type" v="AI prompt defense" />
+                    <Row k="Conversation" v={selected.conversation_id || "-"} />
+                    <Row k="Rule hits" v={String(selected.features?.rule_hits ?? 0)} />
+                    <Row k="Approx tokens" v={String(selected.features?.approx_tokens ?? 0)} />
+                    <Text style={styles.promptPreview}>{selected.ai_prompt_redacted || "Prompt hidden"}</Text>
+                  </>
+                ) : (
+                  <>
+                    <Row k="Login hour" v={String(selected.features.login_hour)} />
+                    <Row k="Device" v={selected.features.device_type} />
+                    <Row k="Location" v={selected.features.geo_location} />
+                    <Row k="IP" v={selected.features.ip_address} />
+                    <Row k="Failed attempts" v={String(selected.features.failed_attempts)} />
+                  </>
+                )}
 
                 {selected.status === "pending" ? (
                   <>
@@ -272,6 +286,7 @@ const styles = StyleSheet.create({
   kvRow: { flexDirection: "row", justifyContent: "space-between", paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: colors.border },
   kvKey: { color: colors.textTertiary, fontSize: 12 },
   kvVal: { color: colors.textPrimary, fontSize: 12, fontFamily: mono },
+  promptPreview: { color: colors.textPrimary, fontSize: 12, fontFamily: mono, lineHeight: 17, marginTop: 10, backgroundColor: "#0F0F0F", borderRadius: 8, borderWidth: 1, borderColor: colors.border, padding: 10 },
   noteInput: { backgroundColor: "#0F0F0F", borderWidth: 1, borderColor: colors.border, borderRadius: 8, padding: 10, color: colors.textPrimary, fontSize: 13, minHeight: 60, textAlignVertical: "top" },
   err: { color: colors.high, fontSize: 12, marginTop: 10, fontFamily: mono },
   actionRow: { flexDirection: "row", gap: 10, marginTop: 16 },

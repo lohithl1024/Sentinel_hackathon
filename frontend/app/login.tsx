@@ -12,16 +12,16 @@ import { colors, mono } from "../src/theme";
 const BG_IMG = "https://images.pexels.com/photos/14314638/pexels-photo-14314638.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940";
 
 const DEMO = [
-  { email: "security@gmail.com", pw: "Security@123", role: "Security" },
-  { email: "alice@ueba.io", pw: "Alice@123", role: "Employee" },
-  { email: "carol@ueba.io", pw: "Carol@123", role: "CEO" },
+  { name: "Vaibhav Rao", email: "security@gmail.com", pw: "Security@123", role: "Security Team" },
+  { name: "Layana Joseph", email: "punith@gmail.com", pw: "Punith@123", role: "Employee" },
+  { name: "Ramesh Iyer", email: "sudeep@gmail.com", pw: "Sudeep@123", role: "CEO" },
 ];
 
 export default function Login() {
   const router = useRouter();
   const { login } = useAuth();
-  const [email, setEmail] = useState("alice@ueba.io");
-  const [pw, setPw] = useState("Alice@123");
+  const [email, setEmail] = useState("security@gmail.com");
+  const [pw, setPw] = useState("Security@123");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -111,6 +111,7 @@ export default function Login() {
                 >
                   <Ionicons name="person-circle-outline" size={18} color={colors.textSecondary} />
                   <View style={{ flex: 1 }}>
+                    <Text style={styles.demoName}>{d.name}</Text>
                     <Text style={styles.demoEmail}>{d.email}</Text>
                     <Text style={styles.demoRole}>{d.role}</Text>
                   </View>
@@ -145,6 +146,7 @@ const styles = StyleSheet.create({
   demoCard: { marginTop: 20, backgroundColor: colors.card, borderRadius: 12, padding: 14, borderWidth: 1, borderColor: colors.border },
   demoTitle: { color: colors.textTertiary, fontSize: 10, letterSpacing: 2, fontWeight: "700", marginBottom: 8 },
   demoRow: { flexDirection: "row", alignItems: "center", paddingVertical: 8, gap: 8 },
+  demoName: { color: colors.textPrimary, fontSize: 13, fontWeight: "700" },
   demoEmail: { color: colors.textPrimary, fontSize: 13, fontFamily: mono },
   demoRole: { color: colors.textTertiary, fontSize: 10, marginTop: 2 },
   demoPw: { color: colors.textSecondary, fontSize: 12, fontFamily: mono },

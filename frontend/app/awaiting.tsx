@@ -98,7 +98,7 @@ export default function Awaiting() {
         <View style={styles.hintBox}>
           <Ionicons name="information-circle-outline" size={18} color={colors.primary} />
           <Text style={styles.hintText}>
-            To approve: sign in as <Text style={styles.hintMono}>admin@ueba.io</Text> or <Text style={styles.hintMono}>secops@ueba.io</Text> and use the Approvals tab.
+            To approve: sign in as <Text style={styles.hintMono}>security@gmail.com</Text> and use the Approvals tab.
           </Text>
         </View>
 

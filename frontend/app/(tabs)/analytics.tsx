@@ -4,11 +4,12 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { LineChart, BarChart } from "react-native-chart-kit";
 import { useAuth, apiGet } from "../../src/auth";
 import { colors, mono } from "../../src/theme";
+import { Redirect } from "expo-router";
 
 const screenW = Dimensions.get("window").width;
 
 export default function Analytics() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const [data, setData] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -20,6 +21,8 @@ export default function Analytics() {
   }, [token]);
 
   useEffect(() => { load(); }, [load]);
+
+  if (user?.role === "security_team") return <Redirect href="/dashboard" />;
 
   if (loading || !data) return <View style={styles.center}><ActivityIndicator color={colors.primary} /></View>;
 

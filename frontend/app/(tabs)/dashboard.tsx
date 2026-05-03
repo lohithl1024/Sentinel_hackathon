@@ -16,19 +16,29 @@ type Event = {
 
 export default function Dashboard() {
   const { user, token, logout } = useAuth();
+  const isSecurity = user?.role === "security_team";
   const router = useRouter();
   const [logs, setLogs] = useState<Event[]>([]);
   const [alerts, setAlerts] = useState<any[]>([]);
+  const [ai, setAi] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const [l, a] = await Promise.all([apiGet("/api/logs/all?limit=50", token), apiGet("/api/alerts?limit=20", token)]);
-      setLogs(l); setAlerts(a);
+      const requests = [
+        apiGet("/api/logs/all?limit=50", token),
+        apiGet("/api/alerts?limit=20", token),
+        ...(isSecurity ? [] : [apiGet("/api/ai/analytics", token)]),
+      ];
+      const [l, a, aiStats] = await Promise.allSettled(requests);
+      if (l.status === "fulfilled") setLogs(l.value);
+      if (a.status === "fulfilled") setAlerts(a.value);
+      if (!isSecurity && aiStats?.status === "fulfilled") setAi(aiStats.value);
+      if (isSecurity) setAi(null);
     } catch (e) { console.warn(e); }
     finally { setLoading(false); setRefreshing(false); }
-  }, [token]);
+  }, [isSecurity, token]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -56,6 +66,31 @@ export default function Dashboard() {
         contentContainerStyle={{ paddingBottom: 24 }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor={colors.primary} />}
       >
+        {!isSecurity && ai && (
+          <View style={styles.aiPanel}>
+            <View style={styles.aiHead}>
+              <View>
+                <Text style={styles.cardLabel}>AI DEFENSE POSTURE</Text>
+                <Text style={styles.aiTitle}>Prompt Firewall Active</Text>
+              </View>
+              <Ionicons name="shield-checkmark" size={28} color={colors.primary} />
+            </View>
+            <View style={styles.aiGrid}>
+              <StatCard label="AI EVENTS" value={String(ai.total_events || 0)} color={colors.primary} icon="chatbubbles" />
+              <StatCard label="RULE HITS" value={String(ai.rule_hits || 0)} color={colors.medium} icon="bug" />
+              <StatCard label="BLOCKS" value={String((ai.action_distribution?.BLOCK || 0) + (ai.action_distribution?.BLOCK_AND_QUEUE_APPROVAL || 0))} color={colors.critical} icon="ban" />
+            </View>
+            <View style={styles.aiLevelRow}>
+              {["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((level) => (
+                <View key={level} style={[styles.aiLevel, { borderColor: riskBorder(level), backgroundColor: riskBg(level) }]}>
+                  <Text style={[styles.aiLevelValue, { color: riskColor(level) }]}>{ai.level_distribution?.[level] || 0}</Text>
+                  <Text style={styles.aiLevelLabel}>{level}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        )}
+
         {/* Latest risk card */}
         {latest && (
           <View testID="latest-risk-card" style={[styles.riskCard, { borderColor: riskBorder(latest.risk_level), backgroundColor: riskBg(latest.risk_level) }]}>
@@ -85,7 +120,7 @@ export default function Dashboard() {
         </View>
 
         {/* Recent events */}
-        <Text style={styles.sectionTitle}>RECENT ACTIVITY</Text>
+        <Text style={styles.sectionTitle}>SUPPORTING LOGIN ACTIVITY</Text>
         {logs.slice(0, 8).map((ev) => (
           <View key={ev.event_id} style={styles.evRow} testID={`ev-${ev.event_id}`}>
             <View style={[styles.dot, { backgroundColor: riskColor(ev.risk_level) }]} />
@@ -136,6 +171,14 @@ const styles = StyleSheet.create({
   userName: { color: colors.textPrimary, fontSize: 18, fontWeight: "700" },
   iconBtn: { width: 40, height: 40, alignItems: "center", justifyContent: "center", backgroundColor: colors.card, borderRadius: 10, borderWidth: 1, borderColor: colors.border },
   riskCard: { marginHorizontal: 16, borderWidth: 1, borderRadius: 16, padding: 20, marginBottom: 16 },
+  aiPanel: { marginHorizontal: 16, backgroundColor: colors.card, borderRadius: 12, padding: 16, borderWidth: 1, borderColor: colors.border, marginBottom: 16 },
+  aiHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
+  aiTitle: { color: colors.textPrimary, fontSize: 18, fontWeight: "700", marginTop: 4 },
+  aiGrid: { flexDirection: "row", gap: 8 },
+  aiLevelRow: { flexDirection: "row", gap: 8, marginTop: 12 },
+  aiLevel: { flex: 1, borderRadius: 8, borderWidth: 1, paddingVertical: 8, alignItems: "center" },
+  aiLevelValue: { fontSize: 18, fontFamily: mono, fontWeight: "700" },
+  aiLevelLabel: { color: colors.textTertiary, fontSize: 8, letterSpacing: 1, marginTop: 2, fontWeight: "700" },
   row: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   cardLabel: { color: colors.textTertiary, fontSize: 10, letterSpacing: 2, fontWeight: "700" },
   riskLevel: { color: colors.textPrimary, fontSize: 22, fontWeight: "700", marginTop: 4 },

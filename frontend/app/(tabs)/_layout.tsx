@@ -77,9 +77,10 @@ export default function TabsLayout() {
         tabBarIcon: ({ color, size }) => <Ionicons name="analytics-outline" size={size} color={color} />,
       }} />
 
-      {/* Analytics - visible to all */}
+      {/* Analytics - hidden for security team to keep the operator flow focused */}
       <Tabs.Screen name="analytics" options={{
         title: "ANALYTICS",
+        href: isSec ? null : "/analytics",
         tabBarIcon: ({ color, size }) => <Ionicons name="stats-chart-outline" size={size} color={color} />,
       }} />
 

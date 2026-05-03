@@ -119,6 +119,17 @@ export async function apiPost(path: string, body: any, token: string | null) {
   return data;
 }
 
+export async function apiUpload(path: string, form: FormData, token: string | null) {
+  const res = await fetch(`${BACKEND}${path}`, {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || `UPLOAD ${path} failed`);
+  return data;
+}
+
 export async function apiGetPublic(path: string) {
   const res = await fetch(`${BACKEND}${path}`);
   if (!res.ok) throw new Error(`GET ${path} -> ${res.status}`);

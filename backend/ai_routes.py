@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from ai_proxy import (
     score_prompt, score_response, aggregate_risk, risk_level_v2, decide_v2,
     velocity_features, velocity_risk, record_usage, mask_pii, repeat_count,
-    call_llm, train_prompt_model,
+    call_llm, train_prompt_model, train_attack_classifier,
 )
 
 log = logging.getLogger("ai_routes")
@@ -55,6 +55,9 @@ def classify_attack(reasons: List[str], feats: dict) -> List[str]:
     """Classify attack types based on detected patterns"""
     attacks = []
     reasons_lower = " ".join(reasons).lower()
+    classifier_label = feats.get("classifier_label")
+    if classifier_label and classifier_label != "NORMAL":
+        attacks.append(classifier_label)
     
     if "injection" in reasons_lower or "ignore" in reasons_lower:
         attacks.append("PROMPT_INJECTION")
@@ -66,12 +69,25 @@ def classify_attack(reasons: List[str], feats: dict) -> List[str]:
         attacks.append("PII_EXTRACTION")
     if "encoded" in reasons_lower or "base64" in reasons_lower:
         attacks.append("ENCODED_PAYLOAD")
+    if (
+        "confidential" in reasons_lower
+        or "internal-use" in reasons_lower
+        or "sensitive identifier" in reasons_lower
+        or feats.get("sensitive_score", 0) >= 35
+    ):
+        attacks.append("SENSITIVE_DATA_UPLOAD")
+        attacks.append("CONFIDENTIAL_DATA_EXFILTRATION")
     if feats.get("rule_hits", 0) >= 2 and "role" in reasons_lower:
         attacks.append("ROLE_MANIPULATION")
     if feats.get("repeat_count", 0) >= 3:
         attacks.append("REPETITION_ATTACK")
     
-    return attacks if attacks else ["NORMAL"]
+    # de-dupe preserving order
+    seen, out = set(), []
+    for attack in attacks or ["NORMAL"]:
+        if attack not in seen:
+            seen.add(attack); out.append(attack)
+    return out
 
 
 # =============================================================================
@@ -285,6 +301,54 @@ async def _store_alert(db, ev: dict) -> None:
         "timestamp": ev["timestamp"],
         "simulated": ev.get("simulated", False),
     })
+
+
+async def _store_scan_event(db, user: dict, result: dict, inp: ScanIn, text: str) -> dict:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    event_id = str(uuid.uuid4())
+    prompt_masked, prompt_pii_count, _ = mask_pii(text)
+    ev_doc = {
+        "event_id": event_id,
+        "kind": f"ai_scan_{inp.input_type}",
+        "timestamp": timestamp,
+        "user_id": user["id"],
+        "email": user["email"],
+        "name": user.get("name"),
+        "role": user.get("role"),
+        "conversation_id": inp.context or f"scan-{uuid.uuid4().hex[:8]}",
+        "prompt_redacted": prompt_masked,
+        "prompt_pii_count": prompt_pii_count,
+        "prompt_risk": result["risk_score"],
+        "prompt_features": result["features"],
+        "prompt_reasons": result["reasons"],
+        "velocity": {},
+        "velocity_risk": 0,
+        "velocity_reasons": [],
+        "response_redacted": None,
+        "response_pii_count": 0,
+        "response_risk": 0,
+        "response_reasons": [],
+        "tokens_used": 0,
+        "role_deviation": 0,
+        "risk_score": result["risk_score"],
+        "risk_level": result["risk_level"],
+        "action": result["action"],
+        "attack_types": result["attack_types"],
+        "session_behavior": {"pattern": "SCAN_ONLY", "session_risk": result["risk_score"]},
+        "explanation": result["reasons"] or ["No prompt-injection indicators detected"],
+        "blocked_at_input": result["action"] in ("BLOCK", "BLOCK_AND_QUEUE_APPROVAL"),
+        "simulated": False,
+        "input_type": inp.input_type,
+    }
+    await _store_event(db, ev_doc)
+    if result["risk_level"] in ("HIGH", "CRITICAL"):
+        await _store_alert(db, ev_doc)
+    result.update({
+        "event_id": event_id,
+        "input_type": inp.input_type,
+        "context": inp.context,
+    })
+    return result
 
 
 async def _queue_ai_approval(db, ev: dict, user: dict, raw_prompt: str) -> str:
@@ -503,6 +567,27 @@ def register_ai_routes(app, db, current_user_dep):
     async def ai_chat(inp: ChatIn, user=Depends(current_user_dep)):
         return await _process_chat(db, user, inp.message, inp.conversation_id, inp.simulate)
 
+    @ai_router.post("/scan")
+    async def ai_scan(inp: ScanIn, user=Depends(current_user_dep)):
+        result = scan_text_for_injection(inp.text)
+        return await _store_scan_event(db, user, result, inp, inp.text)
+
+    @ai_router.post("/scan-file")
+    async def ai_scan_file(
+        file: UploadFile = File(...),
+        context: Optional[str] = Form(None),
+        user=Depends(current_user_dep),
+    ):
+        content = await file.read()
+        text = extract_text_from_file(content, file.filename or "upload.txt")
+        if not text.strip():
+            raise HTTPException(400, "No readable text found in uploaded file")
+        result = scan_text_for_injection(text)
+        inp = ScanIn(text=text[:16000], input_type="file_content", context=context or file.filename)
+        result["filename"] = file.filename
+        result["bytes"] = len(content)
+        return await _store_scan_event(db, user, result, inp, text)
+
     @ai_router.get("/events/me")
     async def my_events(limit: int = 50, user=Depends(current_user_dep)):
         rows = await db.ai_events.find(
@@ -569,4 +654,5 @@ def register_ai_routes(app, db, current_user_dep):
 
     app.include_router(ai_router)
     train_prompt_model()
+    train_attack_classifier()
     log.info("AI routes registered")

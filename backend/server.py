@@ -785,8 +785,11 @@ async def root():
 async def get_token_usage(user=Depends(current_user)):
     """Get token usage stats for all users - security_team only"""
     require_security_team(user)
-    
-    # Aggregate token usage from ai_events
+
+    now = datetime.now(timezone.utc)
+    last_hour_cutoff = (now - timedelta(hours=1)).isoformat()
+    last_10min_cutoff = (now - timedelta(minutes=10)).isoformat()
+
     pipeline = [
         {"$group": {
             "_id": "$user_id",
@@ -802,20 +805,121 @@ async def get_token_usage(user=Depends(current_user)):
         }},
         {"$sort": {"total_tokens": -1}}
     ]
-    
+
+    hourly_pipeline = [
+        {"$match": {"timestamp": {"$gte": last_hour_cutoff}}},
+        {"$group": {
+            "_id": "$user_id",
+            "tokens_last_hour": {"$sum": "$tokens_used"},
+            "req_last_hour": {"$sum": 1},
+        }}
+    ]
+
+    recent_pipeline = [
+        {"$match": {"timestamp": {"$gte": last_10min_cutoff}}},
+        {"$group": {
+            "_id": "$user_id",
+            "tokens_last_10min": {"$sum": "$tokens_used"},
+            "req_last_10min": {"$sum": 1},
+            "high_risk_last_10min": {"$sum": {"$cond": [{"$gte": ["$risk_score", 61]}, 1, 0]}},
+        }}
+    ]
+
     results = await db.ai_events.aggregate(pipeline).to_list(100)
-    
-    # Get blocked users list
+    hourly_rows = await db.ai_events.aggregate(hourly_pipeline).to_list(100)
+    recent_rows = await db.ai_events.aggregate(recent_pipeline).to_list(100)
+
+    hourly_map = {row["_id"]: row for row in hourly_rows}
+    recent_map = {row["_id"]: row for row in recent_rows}
     blocked_users = await db.blocked_ai_users.find({}, {"_id": 0}).to_list(100)
     blocked_ids = {b["user_id"] for b in blocked_users}
-    
-    # Add blocked status to results
+
+    blended_cost_per_1k = 0.004
+    user_rows = []
     for r in results:
-        r["user_id"] = r.pop("_id")
-        r["is_blocked"] = r["user_id"] in blocked_ids
-        r["avg_risk"] = round(r["avg_risk"] or 0, 1)
-    
-    return results
+        user_id = r.pop("_id")
+        recent = recent_map.get(user_id, {})
+        hourly = hourly_map.get(user_id, {})
+
+        total_tokens = int(r.get("total_tokens") or 0)
+        request_count = int(r.get("request_count") or 0)
+        avg_risk = round(r.get("avg_risk") or 0, 1)
+        tokens_last_hour = int(hourly.get("tokens_last_hour") or 0)
+        req_last_hour = int(hourly.get("req_last_hour") or 0)
+        tokens_last_10min = int(recent.get("tokens_last_10min") or 0)
+        req_last_10min = int(recent.get("req_last_10min") or 0)
+        high_risk_last_10min = int(recent.get("high_risk_last_10min") or 0)
+        avg_tokens_per_request = int(round(total_tokens / request_count)) if request_count else 0
+        projected_hourly_tokens = tokens_last_10min * 6
+        estimated_cost = round((total_tokens / 1000) * blended_cost_per_1k, 2)
+        projected_hourly_cost = round((projected_hourly_tokens / 1000) * blended_cost_per_1k, 2)
+
+        pressure_score = 0
+        if tokens_last_10min > 12000:
+            pressure_score += 40
+        elif tokens_last_10min > 6000:
+            pressure_score += 22
+        if req_last_10min > 30:
+            pressure_score += 30
+        elif req_last_10min > 15:
+            pressure_score += 15
+        if avg_tokens_per_request > 2500:
+            pressure_score += 20
+        elif avg_tokens_per_request > 1200:
+            pressure_score += 10
+        if high_risk_last_10min > 0:
+            pressure_score += min(20, high_risk_last_10min * 5)
+        if avg_risk >= 70:
+            pressure_score += 15
+        pressure_score = min(100, pressure_score)
+
+        if pressure_score >= 70 or projected_hourly_cost >= 2.0:
+            recommendation = "BLOCK_OR_REVIEW"
+        elif pressure_score >= 40 or projected_hourly_cost >= 0.75:
+            recommendation = "RATE_LIMIT_AND_MONITOR"
+        else:
+            recommendation = "ALLOW_AND_WATCH"
+
+        user_rows.append({
+            **r,
+            "user_id": user_id,
+            "is_blocked": user_id in blocked_ids,
+            "avg_risk": avg_risk,
+            "tokens_last_hour": tokens_last_hour,
+            "req_last_hour": req_last_hour,
+            "tokens_last_10min": tokens_last_10min,
+            "req_last_10min": req_last_10min,
+            "high_risk_last_10min": high_risk_last_10min,
+            "avg_tokens_per_request": avg_tokens_per_request,
+            "estimated_cost": estimated_cost,
+            "projected_hourly_tokens": projected_hourly_tokens,
+            "projected_hourly_cost": projected_hourly_cost,
+            "pressure_score": pressure_score,
+            "recommendation": recommendation,
+        })
+
+    user_rows.sort(
+        key=lambda row: (
+            row["is_blocked"],
+            row["pressure_score"],
+            row["projected_hourly_cost"],
+            row["total_tokens"],
+        ),
+        reverse=True,
+    )
+
+    summary = {
+        "user_count": len(user_rows),
+        "blocked_users": len([row for row in user_rows if row["is_blocked"]]),
+        "total_tokens": sum(row["total_tokens"] for row in user_rows),
+        "tokens_last_hour": sum(row["tokens_last_hour"] for row in user_rows),
+        "estimated_total_cost": round(sum(row["estimated_cost"] for row in user_rows), 2),
+        "projected_hourly_cost": round(sum(row["projected_hourly_cost"] for row in user_rows), 2),
+        "active_bursts": len([row for row in user_rows if row["pressure_score"] >= 40]),
+        "high_pressure_users": len([row for row in user_rows if row["pressure_score"] >= 70]),
+    }
+
+    return {"summary": summary, "users": user_rows}
 
 @api.post("/ai/block-user/{user_id}")
 async def block_user_ai(user_id: str, user=Depends(current_user)):
@@ -873,31 +977,31 @@ async def get_blocked_users(user=Depends(current_user)):
 # ---------- Seed ----------
 SEED = [
     # Security operator (single)
-    {"email": "security@gmail.com", "password": "Security@123", "name": "Security Officer",
+    {"email": "security@gmail.com", "password": "Security@123", "name": "Vaibhav Rao",
      "role": "security_team", "shift": "day",
      "baseline_location": "Bangalore, IN", "baseline_device": "laptop", "demo": True},
     # CEO
-    {"email": "sudeep@gmail.com", "password": "Sudeep@123", "name": "Sudeep",
+    {"email": "sudeep@gmail.com", "password": "Sudeep@123", "name": "Ramesh Iyer",
      "role": "ceo", "shift": "day",
      "baseline_location": "Bangalore, IN", "baseline_device": "desktop", "demo": True},
     # Employees (internal)
-    {"email": "punith@gmail.com", "password": "Punith@123", "name": "Punith",
+    {"email": "punith@gmail.com", "password": "Punith@123", "name": "Layana Joseph",
      "role": "employee", "shift": "day",
      "baseline_location": "Bangalore, IN", "baseline_device": "laptop", "demo": True},
-    {"email": "lohith@gmail.com", "password": "Lohith@123", "name": "Lohith",
+    {"email": "lohith@gmail.com", "password": "Lohith@123", "name": "Parinitha Shetty",
      "role": "employee", "shift": "day",
      "baseline_location": "Mumbai, IN", "baseline_device": "laptop", "demo": True},
-    {"email": "sapthagiri@gmail.com", "password": "Sapthagiri@123", "name": "Sapthagiri",
+    {"email": "sapthagiri@gmail.com", "password": "Sapthagiri@123", "name": "Likith Gowda",
      "role": "employee", "shift": "night",
      "baseline_location": "Bangalore, IN", "baseline_device": "laptop", "demo": True},
     # Customers / end-users (use the AI chat)
-    {"email": "prabhu@gmail.com", "password": "Prabhu@123", "name": "Prabhu",
+    {"email": "prabhu@gmail.com", "password": "Prabhu@123", "name": "Tejas Reddy",
      "role": "customer", "shift": "day",
      "baseline_location": "Bangalore, IN", "baseline_device": "mobile", "demo": True},
-    {"email": "gagan@gmail.com", "password": "Gagan@123", "name": "Gagan",
+    {"email": "gagan@gmail.com", "password": "Gagan@123", "name": "Manoj Kumar",
      "role": "customer", "shift": "day",
      "baseline_location": "Hyderabad, IN", "baseline_device": "mobile", "demo": True},
-    {"email": "deepak@gmail.com", "password": "Deepak@123", "name": "Deepak",
+    {"email": "deepak@gmail.com", "password": "Deepak@123", "name": "Nandini Rao",
      "role": "customer", "shift": "day",
      "baseline_location": "Chennai, IN", "baseline_device": "mobile", "demo": True},
 ]
@@ -919,7 +1023,7 @@ async def seed():
         else:
             await db.users.update_one(
                 {"email": u["email"]},
-                {"$set": {"role": u["role"], "shift": u["shift"],
+                {"$set": {"name": u["name"], "role": u["role"], "shift": u["shift"],
                           "baseline_location": u["baseline_location"],
                           "baseline_device": u["baseline_device"],
                           **({"demo": True} if u.get("demo") else {})}},
